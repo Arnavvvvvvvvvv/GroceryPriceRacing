@@ -1,87 +1,130 @@
-# Design Note — PriceDuel
+# Grocery Price Racing — Design Note
 
-## Architecture
+## 1. Overall Architecture
 
+The application follows a simple **client-side comparison architecture** designed for the challenge's scope. The frontend handles search, filtering, comparison, and presentation of normalized product data from Blinkit and Instamart.
+
+I chose this approach over a heavier backend/microservices architecture because the main challenge is **product normalization and comparison**, rather than complex business logic. For a small application, adding multiple services, queues, or a dedicated search infrastructure would introduce unnecessary complexity.
+
+For a production version, I would evolve this into:
+
+```text
+Frontend
+   ↓
+API / Comparison Service
+   ↓
+Product Normalization Layer
+   ↓
+Platform-specific Data Sources
+   ├── Blinkit
+   └── Instamart
 ```
-Browser (React)
-  │
-  ├──▶ Supabase Edge Function (Deno)
-  │      ├──▶ Blinkit API  (zeptonow.com/api/v1/search)
-  │      ├──▶ Instamart API (swiggy.com/api/instamart/search)
-  │      ├──▶ PostgreSQL cache (10-min TTL, for live results)
-  │      └──▶ PostgreSQL product_catalog (fallback when APIs block)
-  │
-  └──▶ Client-side product matching (Jaccard similarity)
+
+This keeps platform-specific integrations separate from the core comparison logic.
+
+---
+
+## 2. How We Decide If Two Listings Are the Same Product
+
+The same product can have different names across platforms. For example:
+
+```text
+Blinkit:    Amul Taaza Toned Milk 1 L
+Instamart:  Amul Taaza Milk - 1L
 ```
 
-**Why this over alternatives:**
+Before comparison, product information is **normalized** by considering:
 
-- *Edge Function proxy* over direct browser calls: Blinkit and Instamart both enforce CORS,
-  so the browser can't reach their APIs. A thin Deno proxy adds the right headers, handles
-  timeouts, and caches results — without standing up a full Node server.
-- *Client-side matching* over server-side: the matching is CPU-light (string similarity on
-  ≤40 products per search) and lets us iterate on heuristics without redeploying the backend.
-- *PostgreSQL cache* over in-memory: Edge Functions are stateless — each request may hit a
-  fresh instance with no shared memory. The database is the only durable store, so the
-  10-minute cache lives there. This keeps upstream request volume reasonable.
+* **Brand**
+* **Product name**
+* **Pack size / quantity**
+* **Unit**
 
-## The real-world problem: APIs fight back
+Text is normalized for differences such as casing, spacing, and unnecessary formatting. Pack size is also considered so that products with different quantities are not incorrectly treated as identical.
 
-Both Blinkit (via zeptonow.com) and Swiggy Instamart actively block automated requests.
-In testing, Blinkit returned **429 (rate-limited)** and Instamart returned **403 (forbidden)**
-within a few requests. This is the messy reality the challenge warned about.
+For example:
 
-**My response — a transparent fallback, not a silent failure:**
+```text
+₹60  — 500 ml
+₹110 — 1 L
+```
 
-1. The Edge Function tries both live APIs in parallel (with 8s timeouts).
-2. If a live API fails (429, 403, timeout, network error), it falls back to a **seeded
-   product catalog** stored in PostgreSQL — 80+ realistic products across 10 search terms,
-   with different prices on each platform to demonstrate the comparison.
-3. The response includes a `source` field (`"live"` or `"catalog"`) per platform, and the UI
-   shows a **blue banner** when displaying catalog data and a **green banner** for live data.
-   The user always knows which mode they're in.
-4. The matching and comparison logic is **identical** in both modes — the catalog data goes
-  through the same Jaccard similarity + quantity bonus pipeline as live data.
+are treated as different pack sizes rather than simply comparing their names.
 
-This is a deliberate engineering call: a working demo with transparent data sourcing beats
-a broken app that "would work if the APIs cooperated." The live API code is intact and will
-work when the platforms aren't blocking — the catalog is a safety net, not a replacement.
+### Where the Matching Breaks Down
 
-## Product matching: how "same product" is decided
+The current approach is intentionally simple and is **not a perfect SKU-level matching system**. It can produce incorrect or missed matches when:
 
-1. **Normalize names**: lowercase, strip quantities ("210g"), strip marketing words
-   ("new", "classic", "premium"), remove punctuation.
-2. **Remove brand tokens** so "Amul Taaza Toned Milk" and "Taaza Toned Milk" still match.
-3. **Extract core token sets** from what remains.
-4. **Jaccard similarity** between Blinkit and Instamart token sets; threshold ≥ 0.35.
-5. **Quantity bonus**: exact match +0.2, near-match (±5%) +0.1, mismatch −0.15. Prevents
-   "Maggi 70g" from pairing with "Maggi 280g Family Pack".
-6. **Greedy assignment**: each Blinkit product takes its best-scoring unmatched Instamart
-   counterpart. Leftovers appear as platform-only cards.
+* Brand information is missing or inconsistent.
+* Platforms use abbreviations or significantly different product names.
+* Products have different flavours or variants.
+* Pack sizes are represented differently.
+* Multipacks are confused with individual products.
+* Similar product names refer to different formulations.
+* The same product has substantially different metadata on each platform.
 
-## Where matching breaks down
+For a production system, I would improve this using a combination of:
 
-- **Brand spelling**: "Amul" vs "GCMMF" — brand removal helps but isn't perfect.
-- **Private labels**: Blinkit's own brand will never token-match Instamart's equivalent.
-- **Short/ambiguous names**: searching "milk" yields 50+ results; a 200ml Amul Taaza may
-  false-match a 500ml Mother Dairy despite the quantity bonus.
-- **Variant explosion**: "Maggi 70g", "Maggi 70g Pack of 4", "Maggi 2-Min Masala 70g" are
-  separate listings — the matcher may pair wrong variants across platforms.
-- **No canonical IDs**: neither platform exposes UPC/GTIN. All matching is heuristic. A
-  production version needs a curated catalogue or barcode database.
+```text
+GTIN / Barcode
+      +
+Structured attributes
+      +
+Fuzzy text matching
+      +
+Image / embedding similarity
+      ↓
+Confidence Score
+```
 
-## Scaling to many locations / many users
+Ambiguous matches could then be flagged rather than automatically merged.
 
-**Locations:** Replace the hardcoded 8-location map with a geocode endpoint (pincode → lat/lon)
-or the browser geolocation API. The cache already keys on location, so there are no
-cross-location conflicts. Both upstream APIs already accept lat/lon, so the API layer scales.
+---
 
-**Users:** The 10-minute cache cuts upstream calls dramatically. For more traffic, increase
-TTL or add a background pre-warm for popular queries. Edge Functions auto-scale horizontally.
-Add per-IP rate limiting to prevent abuse, and a dedicated scraping service with rotating IPs
-if platforms start blocking. Matching is client-side, so CPU cost scales with the user's
-browser, not the server.
+## 3. Scaling to Many Locations and Users
 
-**API resilience:** The catalog fallback means the app degrades gracefully under rate limiting
-or IP blocks. A production version would add a dedicated scraping layer with residential
-proxies, request queues, and retry-with-backoff — but the fallback architecture stays the same.
+The current implementation is designed around a **single-location challenge scenario**. To support multiple locations, location would become a first-class part of the data model.
+
+Instead of storing only:
+
+```text
+Product → Platform → Price
+```
+
+the production model would store:
+
+```text
+Product
+   ↓
+Platform
+   ↓
+Location / Warehouse
+   ↓
+Price + Stock + Timestamp
+```
+
+This is important because quick-commerce prices and availability can vary by delivery location.
+
+For many users, I would introduce:
+
+* **PostgreSQL** for products, locations, prices, and platform data.
+* **Redis** for caching frequently requested product/location combinations.
+* **Database indexes** on product identity, platform, and location.
+* **Debouncing and pagination** for search requests.
+* **Background workers / queues** to refresh prices asynchronously.
+* **Stateless API servers** behind a load balancer for horizontal scaling.
+
+Platform-specific data collection would also be isolated behind separate adapters:
+
+```text
+Comparison Engine
+       ↓
+   Data Adapter
+   ├── Blinkit Adapter
+   ├── Instamart Adapter
+   └── Future Platform Adapter
+```
+
+This means adding another platform or scaling the number of locations would not require rewriting the core comparison logic.
+
+**The main design principle is to keep the challenge implementation simple while keeping product matching, platform integrations, and location-specific data sufficiently separated to support future scale.**
